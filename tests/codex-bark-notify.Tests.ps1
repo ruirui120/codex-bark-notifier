@@ -268,6 +268,72 @@ try {
         throw "The notifier must decrypt its DPAPI secret without loading PowerShell.Security in the hook process."
     }
 
+    $quotaFixture = [pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 25; windowDurationMins = 300 }
+        secondary = [pscustomobject]@{ usedPercent = 73.5; windowDurationMins = 10080 }
+    }
+    $quotaText = Format-CodexQuota -RateLimits $quotaFixture
+    if ($quotaText -notmatch '75%' -or $quotaText -notmatch '26.5%') {
+        throw "Quota text must show remaining percentages, not used percentages."
+    }
+    $swappedQuota = [pscustomobject]@{ primary = $quotaFixture.secondary; secondary = $quotaFixture.primary }
+    if ((Format-CodexQuota -RateLimits $swappedQuota) -ne $quotaText) {
+        throw "Quota windows must be identified by duration, not primary/secondary position."
+    }
+    $unknownText = '"\u6682\u4e0d\u53ef\u7528"' | ConvertFrom-Json
+    $missingQuotaText = Format-CodexQuota -RateLimits $null
+    if (($missingQuotaText -split [regex]::Escape($unknownText)).Count -ne 3) {
+        throw "Unavailable quota must be explicit for both windows, never reported as zero."
+    }
+    foreach ($invalidValue in @($null, "invalid", "NaN")) {
+        $badQuota = @{ primary = @{ usedPercent = $invalidValue; windowDurationMins = 300 } }
+        if ((Format-CodexQuota -RateLimits $badQuota) -ne $missingQuotaText) {
+            throw "Invalid quota data must remain unavailable."
+        }
+    }
+    $expiredQuota = @{ primary = @{ usedPercent = 25; windowDurationMins = 300; resetsAt = 1 } }
+    if ((Format-CodexQuota -RateLimits $expiredQuota) -ne $missingQuotaText) {
+        throw "An expired quota window must not show a stale percentage."
+    }
+    $zeroUsed = @{ primary = @{ usedPercent = 0; windowDurationMins = 300 } }
+    if ((Format-CodexQuota -RateLimits $zeroUsed) -notmatch '100%') {
+        throw "Zero usage must yield 100 percent remaining."
+    }
+
+    # Exercise the outgoing UTF-8 payload, with quota RPC and Bark HTTP mocked.
+    $DryRun = $false
+    $httpCapture = @{ Count = 0; Payload = $null; QuotaCalls = 0 }
+    function Get-CodexRateLimits {
+        param($TimeoutMilliseconds)
+        $httpCapture.QuotaCalls++
+        return $quotaFixture
+    }
+    function Invoke-RestMethod {
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        $httpCapture.Count++
+        $httpCapture.Payload = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json
+        return @{ code = 200 }
+    }
+    foreach ($eventName in @("permission", "stop", "interrupt", "session-end", "complete")) {
+        Send-BarkNotification -EventName $eventName -Title "Test" -Body $expectedTaskName -Level "active" -DedupeKey "" -LogDetail "quota-test" | Out-Null
+        if ($httpCapture.Payload.body -notmatch '75%' -or $httpCapture.Payload.body -notmatch '26.5%' -or
+            $httpCapture.Payload.body -notmatch [regex]::Escape($expectedTaskName)) {
+            throw "Every event must preserve Chinese text and include both quotas in its actual HTTP body."
+        }
+    }
+    $quotaFixture = $null
+    Send-BarkNotification -EventName "stop" -Title "Test" -Body "Test" -Level "active" -DedupeKey "" -LogDetail "quota-unavailable" | Out-Null
+    if ($httpCapture.Payload.body -notmatch [regex]::Escape($unknownText) -or $httpCapture.Count -ne 6) {
+        throw "Quota failure must not prevent Bark notification delivery."
+    }
+    $StatePath = $permissionStatePath
+    Send-BarkNotification -EventName "stop" -Title "Test" -Body "Test" -Level "active" -DedupeKey "quota-repeat" -LogDetail "quota-test" | Out-Null
+    Send-BarkNotification -EventName "stop" -Title "Test" -Body "Test" -Level "active" -DedupeKey "quota-repeat" -LogDetail "quota-test" | Out-Null
+    if ($httpCapture.Count -ne 7 -or $httpCapture.QuotaCalls -ne 7) {
+        throw "A suppressed duplicate must not fetch quota or send another notification."
+    }
+    Remove-Item Function:\Invoke-RestMethod
+
     "All codex-bark-notify tests passed."
 }
 finally {

@@ -222,6 +222,88 @@ function Format-Duration {
     return "$minutes$MinuteText$seconds$SecondText"
 }
 
+function Get-CodexRateLimits {
+    param([int]$TimeoutMilliseconds = 3000)
+
+    $process = $null
+    try {
+        $codexCommand = Get-Command codex.exe -ErrorAction SilentlyContinue
+        if ($null -eq $codexCommand) { return $null }
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $codexCommand.Source
+        $startInfo.Arguments = "app-server"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        [void]$process.Start()
+        # Drain stderr without exposing configuration or authentication details.
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.WriteLine('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-bark-notifier","version":"1.0"}}}')
+        $waitingForId = 1
+        while ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+            $readTask = $process.StandardOutput.ReadLineAsync()
+            $remainingMs = [Math]::Max(1, $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds)
+            if (-not $readTask.Wait($remainingMs) -or $null -eq $readTask.Result) { return $null }
+            $response = $readTask.Result | ConvertFrom-Json
+            if ($response.id -ne $waitingForId) { continue }
+            if ($null -ne $response.error) { return $null }
+            if ($waitingForId -eq 1) {
+                $process.StandardInput.WriteLine('{"method":"initialized"}')
+                $process.StandardInput.WriteLine('{"id":2,"method":"account/rateLimits/read"}')
+                $waitingForId = 2
+                continue
+            }
+            if ($null -ne $response.result.rateLimitsByLimitId) {
+                return $response.result.rateLimitsByLimitId.codex
+            }
+            return $response.result.rateLimits
+        }
+        return $null
+    }
+    catch {
+        # Quota lookup must never prevent a task notification.
+        return $null
+    }
+    finally {
+        if ($null -ne $process) {
+            try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+            $process.Dispose()
+        }
+    }
+}
+
+function Format-CodexQuota {
+    param($RateLimits)
+
+    $unavailable = '"\u6682\u4e0d\u53ef\u7528"' | ConvertFrom-Json
+    $fiveHourLabel = '"\u4e94\u5c0f\u65f6\u5269\u4f59\uff1a"' | ConvertFrom-Json
+    $sevenDayLabel = '"\u4e03\u5929\u5269\u4f59\uff1a"' | ConvertFrom-Json
+    $remaining = @{ 300 = $unavailable; 10080 = $unavailable }
+    foreach ($window in @($RateLimits.primary, $RateLimits.secondary)) {
+        try {
+        if ($null -eq $window -or $null -eq $window.usedPercent) { continue }
+        $minutes = [int]$window.windowDurationMins
+        if (-not $remaining.ContainsKey($minutes)) { continue }
+        $used = 0.0
+        if (-not [double]::TryParse([string]$window.usedPercent, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$used) -or
+            [double]::IsNaN($used) -or [double]::IsInfinity($used)) { continue }
+        if ($null -ne $window.resetsAt -and [long]$window.resetsAt -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { continue }
+        $percent = [Math]::Max(0.0, [Math]::Min(100.0, 100.0 - $used))
+        $remaining[$minutes] = $percent.ToString("0.#", [Globalization.CultureInfo]::InvariantCulture) + "%"
+        }
+        catch {
+            continue
+        }
+    }
+    return "$fiveHourLabel$($remaining[300])`n$sevenDayLabel$($remaining[10080])"
+}
+
 function Test-AndRecordNotification {
     param([string]$DedupeKey, [scriptblock]$SendAction, [int]$DedupeWindowSeconds = 86400)
 
@@ -299,6 +381,7 @@ function Send-BarkNotification {
     }
 
     if ($DryRun) {
+        $requestBodyObject.body = "$Body`n`n$(Format-CodexQuota -RateLimits $null)"
         $requestBodyObject.Remove("device_key")
         $dryRunBody = $requestBodyObject | ConvertTo-Json -Compress
         Write-BarkHookLog -EventName $EventName -Status "dry-run" -Detail $LogDetail
@@ -315,6 +398,10 @@ function Send-BarkNotification {
         $encryptedKey = (Get-Content -LiteralPath $secretPath -Raw).Trim()
         $deviceKey = Unprotect-BarkDeviceKey -EncryptedKey $encryptedKey
 
+        $quotaTimeoutMs = 3000
+        if ($EventName -eq "interrupt") { $quotaTimeoutMs = 500 }
+        $rateLimits = Get-CodexRateLimits -TimeoutMilliseconds $quotaTimeoutMs
+        $requestBodyObject.body = "$Body`n`n$(Format-CodexQuota -RateLimits $rateLimits)"
         $requestBodyObject.device_key = $deviceKey
         $requestBody = $requestBodyObject | ConvertTo-Json -Compress
         $requestBodyBytes = $Utf8WithoutBom.GetBytes($requestBody)

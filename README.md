@@ -10,6 +10,8 @@
 - 任务正常结束、暂停等待输入或需要接管时，都会通过 `Stop` 提醒；
 - 保留旧 `agent-turn-complete` 通知作为兼容兜底，并按 `turn_id` 去重，避免同一轮重复推送；
 - 通知包含 Codex 任务名称；权限通知还会包含工具名称或请求说明；
+- 每条通知附带五小时和七天额度剩余百分比，发送前通过官方 `account/rateLimits/read` 只读接口刷新；按窗口时长识别，剩余 = 100% − 已用；
+- 额度查询失败、缺少窗口或窗口已过期时显示“暂不可用”，不会阻止任务提醒；常规查询最多等 3 秒，中断提醒最多等 0.5 秒；
 - Hook 标准输入、标准输出和 Bark JSON 请求均强制使用 UTF-8，避免中文任务名或权限说明乱码；
 - Bark Device Key 使用 Windows DPAPI 加密，只保存在本机，不写入脚本或仓库；
 - 网络或脚本异常只写入本地日志，不影响 Codex 完成任务。
@@ -55,6 +57,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notif
 ```
 
 ## 安全说明
+
+额度查询需要 `codex.exe` 在 PATH 中可用，并已登录 ChatGPT 账户。脚本启动一个隐藏的临时 `codex app-server` 进程读取额度，结束后关闭；不发起模型任务、不消耗重置次数，也不把登录凭据发送给 Bark。`DryRun` 不查询网络额度，显示“暂不可用”。
 
 - 不要把 Bark Device Key 写进脚本、提交记录、Issue 或截图。
 - DPAPI 密文只能由创建它的 Windows 用户在原电脑上解密。
