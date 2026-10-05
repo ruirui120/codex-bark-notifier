@@ -206,6 +206,67 @@ try {
         throw "The hook must preserve a UTF-8 task name from session_index.jsonl."
     }
 
+    # Desktop's legacy notify callback also fires when an internal child finishes.
+    # A missing task name is not enough to distinguish children from main tasks.
+    foreach ($sessionSource in @(
+        @{ subagent = @{ thread_spawn = @{ parent_thread_id = $fixtureThread; depth = 1 } } },
+        "subagent",
+        "vscode"
+    )) {
+        $sourceThread = "source-fixture-thread"
+        $sourcePath = Join-Path $fixtureDirectory "rollout-$sourceThread.jsonl"
+        $sourceMeta = @{ type = "session_meta"; payload = @{ id = $sourceThread; source = $sessionSource } } |
+            ConvertTo-Json -Depth 8 -Compress
+        Set-Content -LiteralPath $sourcePath -Encoding UTF8 -Value $sourceMeta
+        $sourcePayload = @{ type = "agent-turn-complete"; 'thread-id' = $sourceThread; 'turn-id' = "source-turn" } |
+            ConvertTo-Json -Compress
+        $sourceWriter = [IO.File]::Open($sourcePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+        try {
+            $sourceOutput = Invoke-DryRun -DurationMs 300000 -EventPayload $sourcePayload
+            if ($sessionSource -is [string] -and $sessionSource -eq "vscode") {
+                if ([string]::IsNullOrWhiteSpace($sourceOutput)) {
+                    throw "A real main task must still notify, even without an indexed task name."
+                }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($sourceOutput)) {
+                throw "An internal subagent completion must not claim the main task has finished."
+            }
+            else {
+                foreach ($childEvent in @("Stop", "Interrupt", "SessionEnd")) {
+                    $childHookOutput = Invoke-HookDryRun -EventName $childEvent -ExtraFields @{
+                        session_id = $sourceThread; turn_id = "source-turn"
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($childHookOutput)) {
+                        throw "An internal subagent $childEvent must not claim the main task has stopped."
+                    }
+                }
+                $childPermissionOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+                    session_id = $sourceThread; turn_id = "source-turn"; tool_name = "Bash"
+                }
+                if ([string]::IsNullOrWhiteSpace($childPermissionOutput)) {
+                    throw "A child request routed to a human must still notify; filtering completion must not hide real approvals."
+                }
+            }
+        }
+        finally { $sourceWriter.Dispose() }
+    }
+    $sourceLogs = Get-Content -LiteralPath $testLogPath -Encoding UTF8
+    if (-not ($sourceLogs -match 'complete\s+ignored\s+build=2026-10-06\.2 origin=notify thread=source-fixture-thread turn=source-turn subagent')) {
+        throw "Suppressed child completions must log their build, callback origin, thread and turn."
+    }
+
+    $archivedThread = "archived-child-thread"
+    $archivedDirectory = Join-Path $testProfile ".codex\archived_sessions"
+    New-Item -ItemType Directory -Force -Path $archivedDirectory | Out-Null
+    $archivedMeta = @{ type = "session_meta"; payload = @{ id = $archivedThread; source = @{ subagent = @{ thread_spawn = @{ parent_thread_id = $fixtureThread } } } } } |
+        ConvertTo-Json -Depth 8 -Compress
+    Set-Content -LiteralPath (Join-Path $archivedDirectory "rollout-$archivedThread.jsonl") -Encoding UTF8 -Value $archivedMeta
+    $archivedPayload = @{ type = "agent-turn-complete"; 'thread-id' = $archivedThread; 'turn-id' = "archived-child-turn" } |
+        ConvertTo-Json -Compress
+    if (-not [string]::IsNullOrWhiteSpace((Invoke-DryRun -DurationMs 300000 -EventPayload $archivedPayload))) {
+        throw "An archived child must still be recognized when its legacy callback arrives late."
+    }
+
     $otherEvent = @{ type = "approval-requested" } | ConvertTo-Json -Compress
     if (-not [string]::IsNullOrWhiteSpace((Invoke-DryRun -DurationMs 300000 -EventPayload $otherEvent))) {
         throw "Unrelated events must not notify."

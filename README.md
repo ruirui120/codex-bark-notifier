@@ -9,6 +9,7 @@
 - 人工中断任务时立即提醒；
 - 任务正常结束、暂停等待输入或需要接管时，都会通过 `Stop` 提醒；
 - 保留旧 `agent-turn-complete` 通知作为兼容兜底，并按 `turn_id` 去重，避免同一轮重复推送；
+- 从会话日志的 `session_meta.source` 识别内部子任务，忽略其完成、停止、中断和会话结束事件，避免主任务仍在工作时误报“已完成”；不靠任务名判断，未命名的主任务仍可提醒；
 - 通知包含 Codex 任务名称；权限通知还会包含工具名称或请求说明；
 - 每条通知附带五小时和七天额度剩余百分比，发送前通过官方 `account/rateLimits/read` 只读接口刷新；按窗口时长识别，剩余 = 100% − 已用；
 - 额度查询失败、缺少窗口或窗口已过期时显示“暂不可用”，不会阻止任务提醒；常规查询最多等 3 秒，中断提醒最多等 0.5 秒；
@@ -50,7 +51,7 @@ $hooksPath = "$env:USERPROFILE\.codex\hooks.json"
 
 ## 测试
 
-测试使用 `DryRun`，不会发送真实 Bark 消息。覆盖完成阈值、停止、权限申请、中断、中文任务名、Windows PowerShell 5.1 UTF-8 标准输入、DPAPI 解密和无关事件：
+测试使用 `DryRun` 和模拟 HTTP，不会发送真实 Bark 消息。覆盖完成阈值、主任务与子任务识别、停止、人工/自动权限申请、中断、中文任务名、Windows PowerShell 5.1 UTF-8 标准输入、DPAPI 解密和无关事件：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notify.Tests.ps1
@@ -65,6 +66,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notif
 - 不要把 Bark Device Key 写进脚本、提交记录、Issue 或截图。
 - DPAPI 密文只能由创建它的 Windows 用户在原电脑上解密。
 - `scripts/bark-notify.log` 可能包含任务名称，已加入 `.gitignore`。
+- 日志包含脚本构建编号、通知入口（`hook` / `notify`）、会话 ID 和轮次 ID，便于区分旧版本、主任务及子任务事件；不会记录密钥或命令正文。
 
 ## License
 

@@ -7,12 +7,14 @@
 | 事件 | 何时提醒 | Bark 标题 |
 | --- | --- | --- |
 | `Stop` | 主任务正常结束、暂停等待输入或需要用户继续处理 | Codex 本轮工作已停止 |
-| `PermissionRequest` | Codex 请求命令、文件、网络或 MCP 权限 | Codex 需要权限确认 |
+| `PermissionRequest` | 当前轮次实际由 `user` 人工审批的请求；替我批准不提醒 | Codex 需要权限确认 |
 | `Interrupt` | 用户中断正在运行的主任务 | Codex 任务已中断 |
 | `SessionEnd` | 会话关闭、归档或空闲结束；脚本支持但默认配置未启用 | Codex 会话已结束 |
-| `agent-turn-complete` | 旧版兼容兜底；默认仅本轮达到 180 秒时提醒 | Codex 任务已完成 |
+| `agent-turn-complete` | 主任务的旧版兼容兜底；默认仅本轮达到 180 秒时提醒 | Codex 任务已完成 |
 
 `Stop` 没有时长门槛，因此短任务只要结束或等待你处理也会提醒。`Stop`、`Interrupt` 和旧版完成通知使用相同的会话与轮次键去重，避免同一轮连续推送两次。
+
+旧版 `notify` 也会收到内部子任务的完成事件。脚本读取该会话的 `session_meta.source`，识别结构化 `subagent` 来源或旧版字符串 `subagent`，跳过它们的完成、停止、中断和会话结束提醒。即使会话正在写入或已经归档也会检查；未命名任务不一定是子任务，不能仅因缺少名字而过滤。子任务若确实产生需要人工批准的请求，权限提醒仍保留。
 
 Codex 没有单独名为“接管”的 hook。需要权限的接管由 `PermissionRequest` 覆盖；Codex 输出问题并等待用户输入时会触发 `Stop`，因此也会提醒。
 
@@ -73,6 +75,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notif
 测试覆盖：
 
 - 旧完成回调的 179.999 秒、恰好 180 秒和超过 180 秒；
+- 主任务仍提醒，内部子任务和延迟到达的已归档子任务完成事件不提醒；
+- 子任务停止、中断和会话结束不冒充主任务结束，人工权限请求仍保留；
 - `Stop` 不受时长限制；
 - `PermissionRequest` 包含请求说明；
 - `Interrupt` 使用紧急提醒；
@@ -97,6 +101,8 @@ scripts\bark-notify.log
 ```
 
 状态文件只保存最近 24 小时的会话/轮次键和发送时间，不保存 Bark Device Key。日志超过 256 KiB 会自动清空。
+
+发送和忽略记录附带 `build`、`origin`、`thread` 和 `turn`，以便对照真实事件，而不是仅凭“未命名任务”或消息先后顺序推测来源。
 
 ## 官方依据
 

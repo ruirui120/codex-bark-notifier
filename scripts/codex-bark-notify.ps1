@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$NotifierBuild = "2026-10-06.2"
+$LogContext = ""
 $Utf8WithoutBom = New-Object Text.UTF8Encoding($false)
 $OutputEncoding = $Utf8WithoutBom
 try {
@@ -101,7 +103,7 @@ function Write-BarkHookLog {
         if ((Test-Path -LiteralPath $LogPath) -and (Get-Item -LiteralPath $LogPath).Length -gt 262144) {
             Clear-Content -LiteralPath $LogPath
         }
-        $safeDetail = ([string]$Detail) -replace '[\r\n]+', ' '
+        $safeDetail = ("build=$NotifierBuild $LogContext $Detail").Trim() -replace '[\r\n]+', ' '
         Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value "$(Get-Date -Format o)`t$EventName`t$Status`t$safeDetail"
     }
     catch {
@@ -163,6 +165,43 @@ function Find-CodexRolloutPath {
     }
 
     return $null
+}
+
+function Get-CodexSessionKind {
+    param([string]$ThreadId, [string]$TranscriptPath)
+
+    $stream = $null
+    $reader = $null
+    try {
+        $path = $TranscriptPath
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+            $path = Find-CodexRolloutPath -ThreadId $ThreadId
+        }
+        if ([string]::IsNullOrWhiteSpace($path)) { return "unknown" }
+        $sharedAccess = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharedAccess)
+        $reader = New-Object IO.StreamReader($stream, $Utf8WithoutBom)
+        # session_meta is the rollout header. Do not parse an entire active task.
+        for ($index = 0; $index -lt 20 -and $null -ne ($line = $reader.ReadLine()); $index++) {
+            if ($line -notmatch '"type"\s*:\s*"session_meta"') { continue }
+            $entry = $line | ConvertFrom-Json
+            if ($entry.type -ne "session_meta") { continue }
+            if (-not [string]::IsNullOrWhiteSpace([string]$entry.payload.id) -and
+                [string]$entry.payload.id -ne $ThreadId) { continue }
+            $source = $entry.payload.source
+            if (($source -is [string] -and $source -eq "subagent") -or $null -ne $source.subagent) {
+                return "subagent"
+            }
+            if ($null -ne $source) { return "main" }
+            return "unknown"
+        }
+        return "unknown"
+    }
+    catch { return "unknown" }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
+    }
 }
 
 function Get-ApprovalReviewer {
@@ -504,6 +543,13 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($hookEventName)) {
         $threadId = [string]$notification.session_id
         $turnId = [string]$notification.turn_id
+        $LogContext = "origin=hook thread=$threadId turn=$turnId"
+        if ($hookEventName -in @("Stop", "Interrupt", "SessionEnd") -and
+            (Get-CodexSessionKind -ThreadId $threadId -TranscriptPath ([string]$notification.transcript_path)) -eq "subagent") {
+            Write-BarkHookLog -EventName "hook" -Status "ignored" -Detail "subagent event=$hookEventName"
+            if (-not $DryRun) { [Console]::Out.WriteLine("{}") }
+            return
+        }
         $taskName = Get-CodexTaskName -ThreadId $threadId
         if ([string]::IsNullOrWhiteSpace($taskName)) {
             $taskName = $UnnamedTaskText
@@ -563,6 +609,12 @@ try {
 
     $threadId = [string]$notification.'thread-id'
     $turnId = [string]$notification.'turn-id'
+    $LogContext = "origin=notify thread=$threadId turn=$turnId"
+    $sessionKind = Get-CodexSessionKind -ThreadId $threadId
+    if ($sessionKind -eq "subagent") {
+        Write-BarkHookLog -EventName "complete" -Status "ignored" -Detail "subagent"
+        return
+    }
     $durationMs = Get-CodexTurnDurationMs -ThreadId $threadId -TurnId $turnId
     $minimumDurationMs = [long]$MinimumDurationSeconds * 1000
     if ($null -eq $durationMs) {
@@ -581,7 +633,7 @@ try {
     $durationText = Format-Duration -DurationMs $durationMs
     $body = "$TaskLabel$taskName`n$DurationLabel$durationText`n$CompleteBodyText"
     $key = "turn:$threadId`:$turnId"
-    $result = Send-BarkNotification -EventName "complete" -Title $CompleteTitle -Body $body -Level "active" -DedupeKey $key -LogDetail "task=$taskName durationMs=$durationMs"
+    $result = Send-BarkNotification -EventName "complete" -Title $CompleteTitle -Body $body -Level "active" -DedupeKey $key -LogDetail "task=$taskName durationMs=$durationMs sessionKind=$sessionKind"
     if ($DryRun) { $result }
 }
 catch {
