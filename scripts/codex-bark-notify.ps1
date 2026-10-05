@@ -223,7 +223,7 @@ function Format-Duration {
 }
 
 function Test-AndRecordNotification {
-    param([string]$DedupeKey, [scriptblock]$SendAction)
+    param([string]$DedupeKey, [scriptblock]$SendAction, [int]$DedupeWindowSeconds = 86400)
 
     if ($DryRun -or [string]::IsNullOrWhiteSpace($DedupeKey)) {
         return (& $SendAction)
@@ -235,14 +235,14 @@ function Test-AndRecordNotification {
         $hasLock = $mutex.WaitOne(20000)
         if (-not $hasLock) {
             Write-BarkHookLog -EventName "dedupe" -Status "timeout" -Detail $DedupeKey
-            return (& $SendAction)
+            return $false
         }
 
         $now = [DateTimeOffset]::UtcNow
         $entries = @()
         if (Test-Path -LiteralPath $StatePath) {
             try {
-                $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+                $saved = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
                 $entries = @($saved.entries | Where-Object {
                     $sentAt = [DateTimeOffset]::MinValue
                     [DateTimeOffset]::TryParse([string]$_.sent_at, [ref]$sentAt) -and $sentAt -gt $now.AddHours(-24)
@@ -253,13 +253,17 @@ function Test-AndRecordNotification {
             }
         }
 
-        if ($entries | Where-Object { [string]$_.key -eq $DedupeKey }) {
+        if ($entries | Where-Object {
+            [string]$_.key -eq $DedupeKey -and
+            [DateTimeOffset]::Parse([string]$_.sent_at) -gt $now.AddSeconds(-$DedupeWindowSeconds)
+        }) {
             Write-BarkHookLog -EventName "dedupe" -Status "ignored" -Detail $DedupeKey
             return $false
         }
 
         $sent = & $SendAction
         if ($sent) {
+            $entries = @($entries | Where-Object { [string]$_.key -ne $DedupeKey })
             $entries += [pscustomobject]@{ key = $DedupeKey; sent_at = $now.ToString("o") }
             $stateDirectory = Split-Path -Parent $StatePath
             New-Item -ItemType Directory -Force -Path $stateDirectory | Out-Null
@@ -282,7 +286,8 @@ function Send-BarkNotification {
         [string]$Body,
         [string]$Level,
         [string]$DedupeKey,
-        [string]$LogDetail
+        [string]$LogDetail,
+        [int]$DedupeWindowSeconds = 86400
     )
 
     $requestBodyObject = @{
@@ -300,7 +305,7 @@ function Send-BarkNotification {
         return $dryRunBody
     }
 
-    return Test-AndRecordNotification -DedupeKey $DedupeKey -SendAction {
+    return Test-AndRecordNotification -DedupeKey $DedupeKey -DedupeWindowSeconds $DedupeWindowSeconds -SendAction {
         $secretPath = Join-Path $env:USERPROFILE ".codex\secrets\bark-device-key.dpapi"
         if (-not (Test-Path -LiteralPath $secretPath)) {
             Write-BarkHookLog -EventName $EventName -Status "failed" -Detail "secret missing"
@@ -355,7 +360,11 @@ try {
                     $requestText = $requestText.Substring(0, 120)
                 }
                 $body = "$TaskLabel$taskName`n$RequestLabel$requestText`n$PermissionBodyText"
-                $result = Send-BarkNotification -EventName "permission" -Title $PermissionTitle -Body $body -Level "timeSensitive" -DedupeKey "" -LogDetail "task=$taskName tool=$($notification.tool_name)"
+                $key = "permission:$threadId"
+                if ([string]::IsNullOrWhiteSpace($threadId)) {
+                    $key = "permission-cwd:$($notification.cwd)"
+                }
+                $result = Send-BarkNotification -EventName "permission" -Title $PermissionTitle -Body $body -Level "timeSensitive" -DedupeKey $key -DedupeWindowSeconds 300 -LogDetail "task=$taskName tool=$($notification.tool_name)"
                 if ($DryRun) { $result }
             }
             "Stop" {

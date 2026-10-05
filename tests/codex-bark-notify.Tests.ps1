@@ -218,6 +218,48 @@ try {
     $testDeviceKey = "test-device-key-12345"
     $testSecureKey = ConvertTo-SecureString -String $testDeviceKey -AsPlainText -Force
     $testEncryptedKey = ConvertFrom-SecureString -SecureString $testSecureKey
+    $secretDirectory = Join-Path $testProfile ".codex\secrets"
+    New-Item -ItemType Directory -Force -Path $secretDirectory | Out-Null
+    Set-Content -LiteralPath (Join-Path $secretDirectory "bark-device-key.dpapi") -Value $testEncryptedKey -Encoding ASCII
+    $permissionStatePath = Join-Path $testProfile ".codex\state\permission-test.json"
+    $httpCapture = @{ Count = 0 }
+    function Invoke-RestMethod {
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        $httpCapture.Count++
+        return @{ code = 200 }
+    }
+    foreach ($tool in @("Bash", "apply_patch", "Bash")) {
+        $approvalPayload = @{
+            hook_event_name = "PermissionRequest"
+            session_id = "approval-session"
+            turn_id = "turn-$tool"
+            tool_name = $tool
+            tool_input = @{ description = "Request $tool" }
+        } | ConvertTo-Json -Depth 5 -Compress
+        & $scriptPath -NotificationJson $approvalPayload -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    }
+    if ($httpCapture.Count -ne 1) {
+        throw "A burst of different approval tools in one session must send only one notification."
+    }
+    $otherSession = @{ hook_event_name = "PermissionRequest"; session_id = "other-session"; tool_name = "Bash" } | ConvertTo-Json
+    & $scriptPath -NotificationJson $otherSession -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    $stopDuringCooldown = @{ hook_event_name = "Stop"; session_id = "approval-session"; turn_id = "stop-turn" } | ConvertTo-Json
+    & $scriptPath -NotificationJson $stopDuringCooldown -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    if ($httpCapture.Count -ne 3) {
+        throw "Permission cooldown must not suppress another session or Stop notifications."
+    }
+    $permissionState = Get-Content -LiteralPath $permissionStatePath -Raw | ConvertFrom-Json
+    foreach ($entry in $permissionState.entries) {
+        if ($entry.key -eq "permission:approval-session") {
+            $entry.sent_at = [DateTimeOffset]::UtcNow.AddSeconds(-301).ToString("o")
+        }
+    }
+    $permissionState | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $permissionStatePath -Encoding UTF8
+    & $scriptPath -NotificationJson $approvalPayload -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    if ($httpCapture.Count -ne 4) {
+        throw "A new approval after the five-minute cooldown must notify again."
+    }
+    Remove-Item Function:\Invoke-RestMethod
     . $scriptPath `
         -NotificationJson (@{ type = "unsupported-test-event" } | ConvertTo-Json -Compress) `
         -DryRun `
