@@ -1,0 +1,46 @@
+{
+  "description": "Bark notifications when Codex stops, needs permission, or is interrupted.",
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1",
+            "async": true,
+            "timeout": 20,
+            "statusMessage": "Sending Bark permission notification"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1",
+            "async": true,
+            "timeout": 20,
+            "statusMessage": "Sending Bark stop notification"
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1 -RequestTimeoutSeconds 2",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1 -RequestTimeoutSeconds 2",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

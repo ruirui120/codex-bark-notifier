@@ -1,12 +1,15 @@
 # Codex Bark Notifier
 
-在 Windows 上监听 Codex 的 `agent-turn-complete` 回调，并在单轮任务耗时达到设定阈值后，通过 [Bark](https://github.com/Finb/Bark) 通知 iPhone。
+在 Windows 上监听 Codex 生命周期事件，并在 Codex 停止工作、等待权限、需要用户继续处理或被中断时，通过 [Bark](https://github.com/Finb/Bark) 通知 iPhone。
 
 默认行为：
 
-- 小于 3 分钟的任务不提醒；
-- 达到或超过 3 分钟时，在任务完成后提醒；
-- 通知包含 Codex 任务名称和本轮耗时；
+- 每次主任务触发 `Stop` 时提醒，不设时长门槛；
+- 请求命令、文件、网络或 MCP 权限时立即提醒；
+- 人工中断任务时立即提醒；
+- 任务正常结束、暂停等待输入或需要接管时，都会通过 `Stop` 提醒；
+- 保留旧 `agent-turn-complete` 通知作为兼容兜底，并按 `turn_id` 去重，避免同一轮重复推送；
+- 通知包含 Codex 任务名称；权限通知还会包含工具名称或请求说明；
 - Bark Device Key 使用 Windows DPAPI 加密，只保存在本机，不写入脚本或仓库；
 - 网络或脚本异常只写入本地日志，不影响 Codex 完成任务。
 
@@ -28,17 +31,23 @@ $secureKey = Read-Host "Bark Device Key" -AsSecureString
 $secureKey | ConvertFrom-SecureString | Set-Content (Join-Path $secretDirectory "bark-device-key.dpapi")
 ```
 
-3. 在 `~/.codex/config.toml` 中配置通知脚本：
+3. 复制 hook 配置，并将 `YOUR_NAME` 替换为自己的 Windows 用户名：
 
-```toml
-notify = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\Users\\YOUR_NAME\\.codex\\hooks\\bark-notify.ps1"]
+```powershell
+Copy-Item .\hooks.example.json "$env:USERPROFILE\.codex\hooks.json"
+$hooksPath = "$env:USERPROFILE\.codex\hooks.json"
+(Get-Content $hooksPath -Raw).Replace("YOUR_NAME", $env:USERNAME) | Set-Content $hooksPath -Encoding UTF8
 ```
+
+如果已经有 `~/.codex/hooks.json`，请合并 `PermissionRequest`、`Stop` 和 `Interrupt` 三组配置，不要直接覆盖。
+
+4. 重新打开 Codex，并按提示审核、信任新 hook；也可以在 Codex CLI 中使用 `/hooks` 查看和信任。
 
 完整说明见 [docs/setup.md](docs/setup.md)。
 
 ## 测试
 
-测试使用 `DryRun`，不会发送真实 Bark 消息：
+测试使用 `DryRun`，不会发送真实 Bark 消息。覆盖完成阈值、停止、权限申请、中断、中文任务名和无关事件：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notify.Tests.ps1
