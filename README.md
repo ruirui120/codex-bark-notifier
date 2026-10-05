@@ -10,6 +10,7 @@
 - 任务正常结束、暂停等待输入或需要接管时，都会通过 `Stop` 提醒；
 - 保留旧 `agent-turn-complete` 通知作为兼容兜底，并按 `turn_id` 去重，避免同一轮重复推送；
 - 通知包含 Codex 任务名称；权限通知还会包含工具名称或请求说明；
+- Hook 标准输入、标准输出和 Bark JSON 请求均强制使用 UTF-8，避免中文任务名或权限说明乱码；
 - Bark Device Key 使用 Windows DPAPI 加密，只保存在本机，不写入脚本或仓库；
 - 网络或脚本异常只写入本地日志，不影响 Codex 完成任务。
 
@@ -47,7 +48,7 @@ $hooksPath = "$env:USERPROFILE\.codex\hooks.json"
 
 ## 测试
 
-测试使用 `DryRun`，不会发送真实 Bark 消息。覆盖完成阈值、停止、权限申请、中断、中文任务名和无关事件：
+测试使用 `DryRun`，不会发送真实 Bark 消息。覆盖完成阈值、停止、权限申请、中断、中文任务名、Windows PowerShell 5.1 UTF-8 标准输入、DPAPI 解密和无关事件：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notify.Tests.ps1

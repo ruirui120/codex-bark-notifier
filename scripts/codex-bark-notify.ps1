@@ -12,6 +12,61 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Utf8WithoutBom = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = $Utf8WithoutBom
+try {
+    [Console]::OutputEncoding = $Utf8WithoutBom
+}
+catch {
+    # Some non-console hosts do not allow changing their output encoding.
+}
+
+function Read-Utf8StandardInput {
+    $standardInput = [Console]::OpenStandardInput()
+    $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+    $reader = New-Object IO.StreamReader($standardInput, $strictUtf8, $true)
+    try {
+        return $reader.ReadToEnd()
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
+function Unprotect-BarkDeviceKey {
+    param([string]$EncryptedKey)
+
+    if ([string]::IsNullOrWhiteSpace($EncryptedKey) -or
+        ($EncryptedKey.Length % 2) -ne 0 -or
+        $EncryptedKey -notmatch '\A[0-9a-fA-F]+\z') {
+        throw "The Bark secret is not a valid DPAPI payload."
+    }
+
+    $cipherBytes = New-Object byte[] ($EncryptedKey.Length / 2)
+    $plainBytes = $null
+    try {
+        if ($null -eq ("System.Security.Cryptography.ProtectedData" -as [type])) {
+            [void][Reflection.Assembly]::Load(
+                "System.Security, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+            )
+        }
+        for ($index = 0; $index -lt $cipherBytes.Length; $index++) {
+            $cipherBytes[$index] = [Convert]::ToByte($EncryptedKey.Substring($index * 2, 2), 16)
+        }
+        $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
+            $cipherBytes,
+            $null,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        return [Text.Encoding]::Unicode.GetString($plainBytes)
+    }
+    finally {
+        [Array]::Clear($cipherBytes, 0, $cipherBytes.Length)
+        if ($null -ne $plainBytes) {
+            [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+        }
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
     $LogPath = Join-Path $PSScriptRoot "bark-notify.log"
@@ -253,22 +308,16 @@ function Send-BarkNotification {
         }
 
         $encryptedKey = (Get-Content -LiteralPath $secretPath -Raw).Trim()
-        $secureKey = ConvertTo-SecureString $encryptedKey
-        $keyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
-        try {
-            $deviceKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($keyPointer)
-        }
-        finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer)
-        }
+        $deviceKey = Unprotect-BarkDeviceKey -EncryptedKey $encryptedKey
 
         $requestBodyObject.device_key = $deviceKey
         $requestBody = $requestBodyObject | ConvertTo-Json -Compress
+        $requestBodyBytes = $Utf8WithoutBom.GetBytes($requestBody)
         Invoke-RestMethod `
             -Uri "https://api.day.app/push" `
             -Method Post `
             -ContentType "application/json; charset=utf-8" `
-            -Body $requestBody `
+            -Body $requestBodyBytes `
             -TimeoutSec $RequestTimeoutSeconds | Out-Null
         Write-BarkHookLog -EventName $EventName -Status "sent" -Detail $LogDetail
         return $true
@@ -278,7 +327,7 @@ function Send-BarkNotification {
 $hookEventName = ""
 try {
     if ([string]::IsNullOrWhiteSpace($NotificationJson)) {
-        $NotificationJson = [Console]::In.ReadToEnd()
+        $NotificationJson = Read-Utf8StandardInput
     }
     if ([string]::IsNullOrWhiteSpace($NotificationJson)) {
         Write-BarkHookLog -EventName "unknown" -Status "ignored" -Detail "empty payload"
@@ -367,7 +416,14 @@ try {
     if ($DryRun) { $result }
 }
 catch {
-    Write-BarkHookLog -EventName $(if ($hookEventName) { $hookEventName } else { "unknown" }) -Status "failed" -Detail ($_.Exception.GetType().Name)
+    $failedCommand = [string]$_.InvocationInfo.MyCommand.Name
+    $failedLine = [int]$_.InvocationInfo.ScriptLineNumber
+    $failureMessage = ([string]$_.Exception.Message) -replace '(?i)\b[0-9a-f]{32,}\b', '[redacted]'
+    if ($failureMessage.Length -gt 160) {
+        $failureMessage = $failureMessage.Substring(0, 160)
+    }
+    $failureDetail = "$($_.Exception.GetType().Name) line=$failedLine command=$failedCommand message=$failureMessage"
+    Write-BarkHookLog -EventName $(if ($hookEventName) { $hookEventName } else { "unknown" }) -Status "failed" -Detail $failureDetail
     if (-not [string]::IsNullOrWhiteSpace($hookEventName) -and -not $DryRun) {
         [Console]::Out.WriteLine("{}")
     }

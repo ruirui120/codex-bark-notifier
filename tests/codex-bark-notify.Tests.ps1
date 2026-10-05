@@ -47,6 +47,38 @@ function Invoke-HookDryRun {
     return ([string]($output -join "`n")).Trim()
 }
 
+function Invoke-WindowsPowerShellStdinDryRun {
+    param([string]$EventPayload)
+
+    $powerShellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powerShellPath
+    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -DryRun -LogPath `"$testLogPath`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+
+    $utf8WithoutBom = New-Object Text.UTF8Encoding($false)
+    $payloadBytes = $utf8WithoutBom.GetBytes($EventPayload)
+    $process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)
+    $process.StandardInput.BaseStream.Flush()
+    $process.StandardInput.Close()
+
+    $standardOutput = $process.StandardOutput.ReadToEnd()
+    $standardError = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace($standardError)) {
+        throw "Windows PowerShell child process failed: $standardError"
+    }
+    return $standardOutput.Trim()
+}
+
 try {
     if (-not [string]::IsNullOrWhiteSpace((Invoke-DryRun -DurationMs 179999))) {
         throw "A task shorter than 180 seconds must not notify."
@@ -102,6 +134,23 @@ try {
     $expectedPermissionTitle = '"Codex \u9700\u8981\u6743\u9650\u786e\u8ba4"' | ConvertFrom-Json
     if ($permissionBody.title -ne $expectedPermissionTitle -or $permissionBody.body -notmatch "Allow network access") {
         throw "PermissionRequest must identify the approval request."
+    }
+
+    $expectedChineseRequest = '"\u5141\u8bb8\u7f51\u7edc\u8bbf\u95ee\u5e76\u7ee7\u7eed\u6267\u884c\u4e2d\u6587\u4efb\u52a1"' | ConvertFrom-Json
+    $utf8StdinPayload = @{
+        hook_event_name = "PermissionRequest"
+        session_id = "utf8-stdin-thread"
+        turn_id = "utf8-stdin-turn"
+        tool_name = "Bash"
+        tool_input = @{ description = $expectedChineseRequest }
+    } | ConvertTo-Json -Depth 5 -Compress
+    $utf8StdinOutput = Invoke-WindowsPowerShellStdinDryRun -EventPayload $utf8StdinPayload
+    if ([string]::IsNullOrWhiteSpace($utf8StdinOutput)) {
+        throw "Windows PowerShell 5.1 must accept UTF-8 hook JSON from standard input."
+    }
+    $utf8StdinBody = ($utf8StdinOutput | ConvertFrom-Json).body
+    if ($utf8StdinBody -notmatch [regex]::Escape($expectedChineseRequest)) {
+        throw "UTF-8 hook input must preserve Chinese notification text."
     }
 
     $interruptOutput = Invoke-HookDryRun -EventName "Interrupt"
@@ -164,6 +213,17 @@ try {
         if ($null -eq $hooksExample.hooks.$requiredEvent) {
             throw "hooks.example.json must configure $requiredEvent."
         }
+    }
+
+    $testDeviceKey = "test-device-key-12345"
+    $testSecureKey = ConvertTo-SecureString -String $testDeviceKey -AsPlainText -Force
+    $testEncryptedKey = ConvertFrom-SecureString -SecureString $testSecureKey
+    . $scriptPath `
+        -NotificationJson (@{ type = "unsupported-test-event" } | ConvertTo-Json -Compress) `
+        -DryRun `
+        -LogPath $testLogPath
+    if ((Unprotect-BarkDeviceKey -EncryptedKey $testEncryptedKey) -ne $testDeviceKey) {
+        throw "The notifier must decrypt its DPAPI secret without loading PowerShell.Security in the hook process."
     }
 
     "All codex-bark-notify tests passed."
