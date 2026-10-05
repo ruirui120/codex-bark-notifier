@@ -5,7 +5,7 @@
 默认行为：
 
 - 每次主任务触发 `Stop` 时提醒，不设时长门槛；
-- 每个任务首次请求命令、文件、网络或 MCP 权限时立即提醒，随后 5 分钟内合并后续权限提醒，避免自动审批或连续操作造成刷屏；不同任务独立计时，结束和中断提醒不受影响；
+- 权限提醒按当前轮次的实际审批接收者判断：`user`（人工审批）才发送；`auto_review` / `guardian_subagent`（替我批准）不发送自动审批请求；不同人工请求分别提醒，仅相同请求去重；
 - 人工中断任务时立即提醒；
 - 任务正常结束、暂停等待输入或需要接管时，都会通过 `Stop` 提醒；
 - 保留旧 `agent-turn-complete` 通知作为兼容兜底，并按 `turn_id` 去重，避免同一轮重复推送；
@@ -59,6 +59,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-bark-notif
 ## 安全说明
 
 额度查询需要 `codex.exe` 在 PATH 中可用，并已登录 ChatGPT 账户。脚本启动一个隐藏的临时 `codex app-server` 进程读取额度，结束后关闭；不发起模型任务、不消耗重置次数，也不把登录凭据发送给 Bark。`DryRun` 不查询网络额度，显示“暂不可用”。
+
+权限事件在审批开始前触发，不能等同于“正在等待用户”。脚本从 Hook 的 `transcript_path` 或该任务 rollout 中读取精确 `turn_id` 的 `turn_context.approvals_reviewer`，使用运行时设置，避免全局配置与任务界面的“替我批准”不一致。运行时信息无法确认时，只记录日志，不虚报人工权限提醒；自动审核拒绝后若任务停止，仍发送 `Stop` 提醒。Computer Use 原生应用授权等独立弹窗不保证触发 `PermissionRequest`，本脚本不声称覆盖所有此类弹窗；MCP/app 单独覆盖审批接收者时，需要 Hook 提供有效接收者或对应运行时信息。
 
 - 不要把 Bark Device Key 写进脚本、提交记录、Issue 或截图。
 - DPAPI 密文只能由创建它的 Windows 用户在原电脑上解密。

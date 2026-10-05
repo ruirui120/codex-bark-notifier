@@ -165,6 +165,78 @@ function Find-CodexRolloutPath {
     return $null
 }
 
+function Get-ApprovalReviewer {
+    param($Notification)
+
+    if ([string]$Notification.approvals_reviewer -eq "guardian_subagent") { return "auto_review" }
+    if ([string]$Notification.approvals_reviewer -in @("user", "auto_review")) {
+        return [string]$Notification.approvals_reviewer
+    }
+
+    # The UI can override config.toml per task. Read the effective current turn,
+    # not a global default or a previous turn's approval mode.
+    $reader = $null
+    try {
+        $path = [string]$Notification.transcript_path
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+            $path = Find-CodexRolloutPath -ThreadId ([string]$Notification.session_id)
+        }
+        if ([string]::IsNullOrWhiteSpace($path)) { return "unknown" }
+        $reviewer = "unknown"
+        # Active rollouts are open for writing. Explicit shared access prevents
+        # File.ReadLines from failing while Codex is still executing this turn.
+        $sharedAccess = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharedAccess)
+        $reader = New-Object IO.StreamReader($stream, $Utf8WithoutBom)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line -notmatch '"type"\s*:\s*"turn_context"') { continue }
+            try {
+                $entry = $line | ConvertFrom-Json
+                if ($entry.type -ne "turn_context") { continue }
+                if (-not [string]::IsNullOrWhiteSpace([string]$Notification.turn_id) -and
+                    [string]$entry.payload.turn_id -ne [string]$Notification.turn_id) { continue }
+                $value = [string]$entry.payload.approvals_reviewer
+                if ($value -eq "guardian_subagent") {
+                    $reviewer = "auto_review"
+                }
+                elseif ($value -in @("user", "auto_review")) {
+                    $reviewer = $value
+                }
+                elseif ([string]::IsNullOrWhiteSpace($value) -and $null -ne $entry.payload.approval_policy) {
+                    # Older Codex versions omitted the default manual reviewer.
+                    $reviewer = "user"
+                }
+            }
+            catch { continue }
+        }
+        return $reviewer
+    }
+    catch { return "unknown" }
+    finally { if ($null -ne $reader) { $reader.Dispose() } }
+}
+
+function Test-RequiresHumanApproval {
+    param($Notification)
+
+    if ([string]$Notification.permission_mode -in @("dontAsk", "bypassPermissions")) { return $false }
+    $reviewer = Get-ApprovalReviewer -Notification $Notification
+    if ($reviewer -eq "user") { return $true }
+    return $false
+}
+
+function Get-PermissionDedupeKey {
+    param($Notification)
+
+    $inputJson = $Notification.tool_input | ConvertTo-Json -Depth 30 -Compress
+    if ([string]::IsNullOrEmpty($inputJson)) { $inputJson = "null" }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha.ComputeHash($Utf8WithoutBom.GetBytes([string]$inputJson))).Replace("-", "")
+    }
+    finally { $sha.Dispose() }
+    return "permission:$($Notification.session_id):$($Notification.turn_id):$($Notification.tool_name):$digest"
+}
+
 function Get-CodexTurnDurationMs {
     param([string]$ThreadId, [string]$TurnId)
 
@@ -439,6 +511,10 @@ try {
 
         switch ($hookEventName) {
             "PermissionRequest" {
+                if (-not (Test-RequiresHumanApproval -Notification $notification)) {
+                    Write-BarkHookLog -EventName "permission" -Status "ignored" -Detail "not-routed-to-human tool=$($notification.tool_name) turn=$turnId"
+                    break
+                }
                 $requestText = [string]$notification.tool_input.description
                 if ([string]::IsNullOrWhiteSpace($requestText)) {
                     $requestText = [string]$notification.tool_name
@@ -447,11 +523,8 @@ try {
                     $requestText = $requestText.Substring(0, 120)
                 }
                 $body = "$TaskLabel$taskName`n$RequestLabel$requestText`n$PermissionBodyText"
-                $key = "permission:$threadId"
-                if ([string]::IsNullOrWhiteSpace($threadId)) {
-                    $key = "permission-cwd:$($notification.cwd)"
-                }
-                $result = Send-BarkNotification -EventName "permission" -Title $PermissionTitle -Body $body -Level "timeSensitive" -DedupeKey $key -DedupeWindowSeconds 300 -LogDetail "task=$taskName tool=$($notification.tool_name)"
+                $key = Get-PermissionDedupeKey -Notification $notification
+                $result = Send-BarkNotification -EventName "permission" -Title $PermissionTitle -Body $body -Level "timeSensitive" -DedupeKey $key -LogDetail "task=$taskName tool=$($notification.tool_name)"
                 if ($DryRun) { $result }
             }
             "Stop" {

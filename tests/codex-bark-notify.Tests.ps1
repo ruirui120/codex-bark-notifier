@@ -26,13 +26,16 @@ function Invoke-DryRun {
 }
 
 function Invoke-HookDryRun {
-    param([string]$EventName, [hashtable]$ExtraFields)
+    param([string]$EventName, [hashtable]$ExtraFields, [switch]$InferReviewer)
 
     $hookPayload = @{
         hook_event_name = $EventName
         session_id = "test-thread"
         turn_id = "test-turn"
         permission_mode = "default"
+    }
+    if ($EventName -eq "PermissionRequest" -and -not $InferReviewer) {
+        $hookPayload.approvals_reviewer = "user"
     }
     if ($null -ne $ExtraFields) {
         foreach ($key in $ExtraFields.Keys) {
@@ -141,6 +144,7 @@ try {
         hook_event_name = "PermissionRequest"
         session_id = "utf8-stdin-thread"
         turn_id = "utf8-stdin-turn"
+        approvals_reviewer = "user"
         tool_name = "Bash"
         tool_input = @{ description = $expectedChineseRequest }
     } | ConvertTo-Json -Depth 5 -Compress
@@ -207,6 +211,110 @@ try {
         throw "Unrelated events must not notify."
     }
 
+    $approvalRolloutPath = Join-Path $fixtureDirectory "rollout-approval-rollout-thread.jsonl"
+    $approvalContexts = @(
+        @{ type = "turn_context"; payload = @{ turn_id = "old-manual-turn"; approvals_reviewer = "user" } },
+        @{ type = "turn_context"; payload = @{ turn_id = "current-auto-turn"; approvals_reviewer = "auto_review" } },
+        @{ type = "turn_context"; payload = @{ turn_id = "legacy-manual-turn"; approval_policy = "on-request" } }
+    ) | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }
+    Set-Content -LiteralPath $approvalRolloutPath -Encoding UTF8 -Value $approvalContexts
+
+    $automaticOutput = Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields @{
+        session_id = "approval-rollout-thread"
+        turn_id = "current-auto-turn"
+        tool_name = "Bash"
+        tool_input = @{ command = "git push" }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($automaticOutput)) {
+        throw "The matching current auto_review turn must suppress permission reminders even after an older manual turn."
+    }
+    $manualOutput = Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields @{
+        session_id = "approval-rollout-thread"
+        turn_id = "old-manual-turn"
+        tool_name = "Bash"
+    }
+    if ([string]::IsNullOrWhiteSpace($manualOutput)) {
+        throw "A matching manual reviewer turn must retain genuine user approval reminders."
+    }
+    $rolloutWriter = [IO.File]::Open($approvalRolloutPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    try {
+        $lockedRolloutOutput = Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields @{
+            session_id = "approval-rollout-thread"
+            turn_id = "old-manual-turn"
+            tool_name = "Bash"
+            tool_input = @{ command = "A real request while Codex is writing the rollout" }
+        }
+        if ([string]::IsNullOrWhiteSpace($lockedRolloutOutput)) {
+            throw "The hook must read effective approval settings while the active rollout is open for writing."
+        }
+    }
+    finally {
+        $rolloutWriter.Dispose()
+    }
+    $legacyManualOutput = Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields @{
+        session_id = "approval-rollout-thread"
+        turn_id = "legacy-manual-turn"
+        tool_name = "Bash"
+    }
+    if ([string]::IsNullOrWhiteSpace($legacyManualOutput)) {
+        throw "A matched legacy turn_context without approvals_reviewer must retain user approval reminders."
+    }
+    foreach ($fields in @(
+        @{ session_id = "missing-context-thread"; turn_id = "missing-context-turn"; tool_name = "Bash" },
+        @{ session_id = "approval-rollout-thread"; turn_id = "unmatched-turn"; tool_name = "Bash" }
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields $fields))) {
+            throw "Without a matching approval context, the hook must not invent a request waiting for the user."
+        }
+    }
+    foreach ($tool in @("mcp__cua_repl__js", "mcp__computer_use__click")) {
+        $uiOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+            approvals_reviewer = "auto_review"
+            tool_name = $tool
+        }
+        if (-not [string]::IsNullOrWhiteSpace($uiOutput)) {
+            throw "Computer-use PermissionRequest events handled by auto_review must not send false user reminders."
+        }
+        $manualUiOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+            approvals_reviewer = "user"
+            tool_name = $tool
+        }
+        if ([string]::IsNullOrWhiteSpace($manualUiOutput)) {
+            throw "Computer-use requests with a manual user reviewer must still notify."
+        }
+    }
+    $preferredTranscript = Join-Path $fixtureDirectory "explicit-transcript.jsonl"
+    $preferredContext = @{
+        type = "turn_context"
+        payload = @{ turn_id = "current-auto-turn"; approvals_reviewer = "user" }
+    } | ConvertTo-Json -Depth 5 -Compress
+    Set-Content -LiteralPath $preferredTranscript -Encoding UTF8 -Value $preferredContext
+    $preferredOutput = Invoke-HookDryRun -EventName "PermissionRequest" -InferReviewer -ExtraFields @{
+        session_id = "approval-rollout-thread"
+        turn_id = "current-auto-turn"
+        transcript_path = $preferredTranscript
+        tool_name = "Bash"
+    }
+    if ([string]::IsNullOrWhiteSpace($preferredOutput)) {
+        throw "An explicit transcript_path must be read before searching by session id."
+    }
+    $explicitAutomaticOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+        approvals_reviewer = "auto_review"
+        transcript_path = $preferredTranscript
+        turn_id = "current-auto-turn"
+        tool_name = "Bash"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($explicitAutomaticOutput)) {
+        throw "An explicit hook reviewer must take precedence over the transcript reviewer."
+    }
+    $guardianOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+        approvals_reviewer = "guardian_subagent"
+        tool_name = "Bash"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($guardianOutput)) {
+        throw "The guardian_subagent reviewer alias must suppress automatically handled approvals."
+    }
+
     $hooksExamplePath = Join-Path (Split-Path $PSScriptRoot -Parent) "hooks.example.json"
     $hooksExample = Get-Content -LiteralPath $hooksExamplePath -Raw | ConvertFrom-Json
     foreach ($requiredEvent in @("PermissionRequest", "Stop", "Interrupt")) {
@@ -228,36 +336,47 @@ try {
         $httpCapture.Count++
         return @{ code = 200 }
     }
-    foreach ($tool in @("Bash", "apply_patch", "Bash")) {
+    foreach ($request in @(
+        @{ tool = "Bash"; command = "git push" },
+        @{ tool = "apply_patch"; command = "*** Update File: example.txt" }
+    )) {
         $approvalPayload = @{
             hook_event_name = "PermissionRequest"
             session_id = "approval-session"
-            turn_id = "turn-$tool"
-            tool_name = $tool
-            tool_input = @{ description = "Request $tool" }
+            turn_id = "approval-turn"
+            approvals_reviewer = "user"
+            tool_name = $request.tool
+            tool_input = @{ description = "A real user approval"; command = $request.command }
         } | ConvertTo-Json -Depth 5 -Compress
         & $scriptPath -NotificationJson $approvalPayload -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
     }
-    if ($httpCapture.Count -ne 1) {
-        throw "A burst of different approval tools in one session must send only one notification."
+    if ($httpCapture.Count -ne 2) {
+        throw "Distinct requests that genuinely need a user must both notify, even within the same turn."
     }
-    $otherSession = @{ hook_event_name = "PermissionRequest"; session_id = "other-session"; tool_name = "Bash" } | ConvertTo-Json
-    & $scriptPath -NotificationJson $otherSession -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
-    $stopDuringCooldown = @{ hook_event_name = "Stop"; session_id = "approval-session"; turn_id = "stop-turn" } | ConvertTo-Json
-    & $scriptPath -NotificationJson $stopDuringCooldown -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
-    if ($httpCapture.Count -ne 3) {
-        throw "Permission cooldown must not suppress another session or Stop notifications."
-    }
-    $permissionState = Get-Content -LiteralPath $permissionStatePath -Raw | ConvertFrom-Json
-    foreach ($entry in $permissionState.entries) {
-        if ($entry.key -eq "permission:approval-session") {
-            $entry.sent_at = [DateTimeOffset]::UtcNow.AddSeconds(-301).ToString("o")
-        }
-    }
-    $permissionState | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $permissionStatePath -Encoding UTF8
     & $scriptPath -NotificationJson $approvalPayload -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    if ($httpCapture.Count -ne 2) {
+        throw "Replaying the exact same approval request must not notify twice."
+    }
+    $otherSession = @{ hook_event_name = "PermissionRequest"; session_id = "other-session"; approvals_reviewer = "user"; tool_name = "Bash" } | ConvertTo-Json
+    & $scriptPath -NotificationJson $otherSession -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    $stopAfterApproval = @{ hook_event_name = "Stop"; session_id = "approval-session"; turn_id = "stop-turn" } | ConvertTo-Json
+    & $scriptPath -NotificationJson $stopAfterApproval -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
     if ($httpCapture.Count -ne 4) {
-        throw "A new approval after the five-minute cooldown must notify again."
+        throw "Permission deduplication must not suppress another session or Stop notifications."
+    }
+    foreach ($tool in @("Bash", "apply_patch", "mcp__github__create_pull_request")) {
+        $automaticPayload = @{
+            hook_event_name = "PermissionRequest"
+            session_id = "automatic-session"
+            turn_id = "automatic-turn"
+            approvals_reviewer = "auto_review"
+            tool_name = $tool
+            tool_input = @{ command = "Automatic approval for $tool" }
+        } | ConvertTo-Json -Depth 5 -Compress
+        & $scriptPath -NotificationJson $automaticPayload -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    }
+    if ($httpCapture.Count -ne 4) {
+        throw "Automatic reviewer requests must be suppressed before sending Bark."
     }
     Remove-Item Function:\Invoke-RestMethod
     . $scriptPath `
