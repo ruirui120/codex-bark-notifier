@@ -12,7 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$NotifierBuild = "2026-10-06.2"
+$NotifierBuild = "2026-10-07.1"
 $LogContext = ""
 $Utf8WithoutBom = New-Object Text.UTF8Encoding($false)
 $OutputEncoding = $Utf8WithoutBom
@@ -170,6 +170,7 @@ function Find-CodexRolloutPath {
 function Get-CodexSessionKind {
     param([string]$ThreadId, [string]$TranscriptPath)
 
+    if ([string]::IsNullOrWhiteSpace($ThreadId)) { return "unknown" }
     $stream = $null
     $reader = $null
     try {
@@ -186,13 +187,16 @@ function Get-CodexSessionKind {
             if ($line -notmatch '"type"\s*:\s*"session_meta"') { continue }
             $entry = $line | ConvertFrom-Json
             if ($entry.type -ne "session_meta") { continue }
-            if (-not [string]::IsNullOrWhiteSpace([string]$entry.payload.id) -and
-                [string]$entry.payload.id -ne $ThreadId) { continue }
+            if ([string]$entry.payload.id -ne $ThreadId) { continue }
             $source = $entry.payload.source
-            if (($source -is [string] -and $source -eq "subagent") -or $null -ne $source.subagent) {
+            if (($source -is [string] -and $source -match '^subagent') -or $null -ne $source.subagent) {
                 return "subagent"
             }
-            if ($null -ne $source) { return "main" }
+            # Unknown/ephemeral sessions can have no persisted metadata at all.
+            # Only a matching, explicitly recognized main source may notify.
+            if ($source -is [string] -and $source -in @("cli", "vscode", "exec", "appServer", "app_server")) {
+                return "main"
+            }
             return "unknown"
         }
         return "unknown"
@@ -279,6 +283,9 @@ function Get-PermissionDedupeKey {
 function Get-CodexTurnDurationMs {
     param([string]$ThreadId, [string]$TurnId)
 
+    if ([string]::IsNullOrWhiteSpace($ThreadId) -or [string]::IsNullOrWhiteSpace($TurnId)) {
+        return $null
+    }
     if ($DurationMsOverride -ge 0) {
         return $DurationMsOverride
     }
@@ -288,30 +295,36 @@ function Get-CodexTurnDurationMs {
         return $null
     }
 
-    $candidateLines = @(Get-Content -LiteralPath $rolloutPath -Tail 600)
-    if (-not ($candidateLines -match [regex]::Escape($TurnId))) {
-        $candidateLines = @(Select-String -LiteralPath $rolloutPath -SimpleMatch -Pattern $TurnId |
-            ForEach-Object { $_.Line })
-    }
-
     $startedAtSeconds = $null
-    foreach ($line in $candidateLines) {
-        try {
-            $entry = $line | ConvertFrom-Json
-            if ($entry.type -ne "event_msg" -or [string]$entry.payload.turn_id -ne $TurnId) {
-                continue
+    $stream = $null
+    $reader = $null
+    try {
+        # Shared forward reads also handle active video/image transcripts with
+        # long lines, where Get-Content -Tail can stall beyond the hook timeout.
+        $sharedAccess = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object IO.FileStream($rolloutPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharedAccess)
+        $reader = New-Object IO.StreamReader($stream, $Utf8WithoutBom)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.IndexOf($TurnId, [StringComparison]::Ordinal) -lt 0 -or
+                $line -notmatch '"type"\s*:\s*"task_(started|complete)"') { continue }
+            try {
+                $entry = $line | ConvertFrom-Json
+                if ($entry.type -ne "event_msg" -or [string]$entry.payload.turn_id -ne $TurnId) { continue }
+                if ($entry.payload.type -eq "task_started" -and $null -ne $entry.payload.started_at -and
+                    [long]$entry.payload.started_at -gt 0) {
+                    $startedAtSeconds = [long]$entry.payload.started_at
+                }
+                elseif ($entry.payload.type -eq "task_complete" -and $null -ne $entry.payload.duration_ms) {
+                    return [long]$entry.payload.duration_ms
+                }
             }
-
-            if ($entry.payload.type -eq "task_started") {
-                $startedAtSeconds = [long]$entry.payload.started_at
-            }
-            elseif ($entry.payload.type -eq "task_complete" -and $null -ne $entry.payload.duration_ms) {
-                return [long]$entry.payload.duration_ms
-            }
+            catch { continue }
         }
-        catch {
-            continue
-        }
+    }
+    catch { return $null }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
     }
 
     if ($null -ne $startedAtSeconds) {
@@ -544,11 +557,23 @@ try {
         $threadId = [string]$notification.session_id
         $turnId = [string]$notification.turn_id
         $LogContext = "origin=hook thread=$threadId turn=$turnId"
-        if ($hookEventName -in @("Stop", "Interrupt", "SessionEnd") -and
-            (Get-CodexSessionKind -ThreadId $threadId -TranscriptPath ([string]$notification.transcript_path)) -eq "subagent") {
-            Write-BarkHookLog -EventName "hook" -Status "ignored" -Detail "subagent event=$hookEventName"
-            if (-not $DryRun) { [Console]::Out.WriteLine("{}") }
-            return
+        if ($hookEventName -in @("Stop", "Interrupt", "SessionEnd")) {
+            $sessionKind = Get-CodexSessionKind -ThreadId $threadId -TranscriptPath ([string]$notification.transcript_path)
+            if ($sessionKind -ne "main") {
+                Write-BarkHookLog -EventName "hook" -Status "ignored" -Detail "session-kind=$sessionKind event=$hookEventName"
+                if (-not $DryRun) { [Console]::Out.WriteLine("{}") }
+                return
+            }
+        }
+        if ($hookEventName -in @("Stop", "Interrupt")) {
+            $durationMs = Get-CodexTurnDurationMs -ThreadId $threadId -TurnId $turnId
+            $minimumDurationMs = [long]$MinimumDurationSeconds * 1000
+            if ($null -eq $durationMs -or $durationMs -lt $minimumDurationMs) {
+                $durationDetail = if ($null -eq $durationMs) { "unavailable" } else { [string]$durationMs }
+                Write-BarkHookLog -EventName "hook" -Status "ignored" -Detail "event=$hookEventName durationMs=$durationDetail thresholdMs=$minimumDurationMs"
+                if (-not $DryRun) { [Console]::Out.WriteLine("{}") }
+                return
+            }
         }
         $taskName = Get-CodexTaskName -ThreadId $threadId
         if ([string]::IsNullOrWhiteSpace($taskName)) {
@@ -611,8 +636,8 @@ try {
     $turnId = [string]$notification.'turn-id'
     $LogContext = "origin=notify thread=$threadId turn=$turnId"
     $sessionKind = Get-CodexSessionKind -ThreadId $threadId
-    if ($sessionKind -eq "subagent") {
-        Write-BarkHookLog -EventName "complete" -Status "ignored" -Detail "subagent"
+    if ($sessionKind -ne "main") {
+        Write-BarkHookLog -EventName "complete" -Status "ignored" -Detail "session-kind=$sessionKind"
         return
     }
     $durationMs = Get-CodexTurnDurationMs -ThreadId $threadId -TurnId $turnId

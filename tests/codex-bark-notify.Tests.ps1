@@ -26,7 +26,13 @@ function Invoke-DryRun {
 }
 
 function Invoke-HookDryRun {
-    param([string]$EventName, [hashtable]$ExtraFields, [switch]$InferReviewer)
+    param(
+        [string]$EventName,
+        [hashtable]$ExtraFields,
+        [switch]$InferReviewer,
+        [long]$DurationMs = 300000,
+        [int]$MinimumDurationSeconds = 180
+    )
 
     $hookPayload = @{
         hook_event_name = $EventName
@@ -46,6 +52,8 @@ function Invoke-HookDryRun {
     $output = & $scriptPath `
         -NotificationJson ($hookPayload | ConvertTo-Json -Depth 5 -Compress) `
         -DryRun `
+        -DurationMsOverride $DurationMs `
+        -MinimumDurationSeconds $MinimumDurationSeconds `
         -LogPath $testLogPath
     return ([string]($output -join "`n")).Trim()
 }
@@ -83,6 +91,48 @@ function Invoke-WindowsPowerShellStdinDryRun {
 }
 
 try {
+    $fixtureDirectory = Join-Path $testProfile ".codex\sessions\2026\09\10"
+    New-Item -ItemType Directory -Force -Path $fixtureDirectory | Out-Null
+    $env:USERPROFILE = $testProfile
+    foreach ($mainThread in @("test-thread", "approval-session")) {
+        $mainMetadata = @{ type = "session_meta"; payload = @{ id = $mainThread; source = "vscode" } } |
+            ConvertTo-Json -Depth 5 -Compress
+        Set-Content -LiteralPath (Join-Path $fixtureDirectory "rollout-$mainThread.jsonl") -Encoding UTF8 -Value $mainMetadata
+    }
+
+    # Ephemeral desktop helpers can emit Stop without ever writing a rollout.
+    # Only confirmed main-session metadata can justify a lifecycle reminder.
+    foreach ($unconfirmedSession in @(
+        @{ name = "missing-metadata"; metadata = $null },
+        @{ name = "corrupt-metadata"; metadata = '{"type":"session_meta","payload":' },
+        @{ name = "unknown-source"; metadata = @{ type = "session_meta"; payload = @{ id = "unknown-source"; source = "future-internal-worker" } } },
+        @{ name = "object-source"; metadata = @{ type = "session_meta"; payload = @{ id = "object-source"; source = @{ internal = "worker" } } } },
+        @{ name = "mismatched-id"; metadata = @{ type = "session_meta"; payload = @{ id = "some-other-main-thread"; source = "vscode" } } },
+        @{ name = "empty-id"; metadata = @{ type = "session_meta"; payload = @{ id = ""; source = "vscode" } } }
+    )) {
+        $unconfirmedThread = $unconfirmedSession.name
+        if ($null -ne $unconfirmedSession.metadata) {
+            $metadataText = $unconfirmedSession.metadata
+            if ($metadataText -isnot [string]) {
+                $metadataText = $metadataText | ConvertTo-Json -Depth 8 -Compress
+            }
+            Set-Content -LiteralPath (Join-Path $fixtureDirectory "rollout-$unconfirmedThread.jsonl") -Encoding UTF8 -Value $metadataText
+        }
+        foreach ($unconfirmedEvent in @("Stop", "Interrupt", "SessionEnd")) {
+            $unconfirmedOutput = Invoke-HookDryRun -EventName $unconfirmedEvent -ExtraFields @{
+                session_id = $unconfirmedThread; turn_id = "unconfirmed-turn"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($unconfirmedOutput)) {
+                throw "An unconfirmed session ($unconfirmedThread) must not send a $unconfirmedEvent reminder."
+            }
+        }
+        $unconfirmedPayload = @{ type = "agent-turn-complete"; 'thread-id' = $unconfirmedThread; 'turn-id' = "unconfirmed-turn" } |
+            ConvertTo-Json -Compress
+        if (-not [string]::IsNullOrWhiteSpace((Invoke-DryRun -DurationMs 300000 -EventPayload $unconfirmedPayload))) {
+            throw "An unconfirmed session ($unconfirmedThread) must not send a legacy completion reminder."
+        }
+    }
+
     if (-not [string]::IsNullOrWhiteSpace((Invoke-DryRun -DurationMs 179999))) {
         throw "A task shorter than 180 seconds must not notify."
     }
@@ -105,11 +155,32 @@ try {
     $stopOutput = Invoke-HookDryRun -EventName "Stop"
     $expectedStopTitle = '"Codex \u672c\u8f6e\u5de5\u4f5c\u5df2\u505c\u6b62"' | ConvertFrom-Json
     if (($stopOutput | ConvertFrom-Json).title -ne $expectedStopTitle) {
-        throw "Every Stop hook must create a Bark notification without a duration threshold."
+        throw "A confirmed main Stop hook above the duration threshold must create a Bark notification."
     }
 
-    $env:USERPROFILE = $testProfile
-    try {
+    foreach ($timedEvent in @("Stop", "Interrupt")) {
+        foreach ($shortDuration in @(0, 179999)) {
+            if (-not [string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName $timedEvent -DurationMs $shortDuration))) {
+                throw "A main $timedEvent at $shortDuration ms must preserve the three-minute minimum."
+            }
+        }
+        foreach ($eligibleDuration in @(180000, 180001)) {
+            if ([string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName $timedEvent -DurationMs $eligibleDuration))) {
+                throw "A main $timedEvent at $eligibleDuration ms must notify at or above the three-minute minimum."
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName $timedEvent -DurationMs -1))) {
+            throw "A main $timedEvent without any matching duration evidence must not invent an eligible duration."
+        }
+        if (-not [string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName $timedEvent -DurationMs 300000 -MinimumDurationSeconds 600))) {
+            throw "A main $timedEvent must honor a larger configured minimum duration."
+        }
+        if ([string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName $timedEvent -DurationMs 120000 -MinimumDurationSeconds 120))) {
+            throw "A main $timedEvent must honor a smaller configured minimum duration."
+        }
+    }
+
+    & {
         $stopPayload = @{
             hook_event_name = "Stop"
             session_id = "test-thread"
@@ -119,24 +190,22 @@ try {
             -NoProfile `
             -ExecutionPolicy Bypass `
             -File $scriptPath `
+            -DurationMsOverride 300000 `
             -LogPath $testLogPath `
             -StatePath (Join-Path $testProfile ".codex\state\bark-notifier.json")
         if (([string]($hookResponse -join "`n")).Trim() -ne "{}") {
             throw "A Stop hook must return valid JSON even when Bark cannot be sent."
         }
     }
-    finally {
-        $env:USERPROFILE = $originalUserProfile
-    }
 
-    $permissionOutput = Invoke-HookDryRun -EventName "PermissionRequest" -ExtraFields @{
+    $permissionOutput = Invoke-HookDryRun -EventName "PermissionRequest" -DurationMs 0 -ExtraFields @{
         tool_name = "Bash"
         tool_input = @{ description = "Allow network access" }
     }
     $permissionBody = $permissionOutput | ConvertFrom-Json
     $expectedPermissionTitle = '"Codex \u9700\u8981\u6743\u9650\u786e\u8ba4"' | ConvertFrom-Json
     if ($permissionBody.title -ne $expectedPermissionTitle -or $permissionBody.body -notmatch "Allow network access") {
-        throw "PermissionRequest must identify the approval request."
+        throw "PermissionRequest must identify a real approval immediately, even below the completion duration threshold."
     }
 
     $expectedChineseRequest = '"\u5141\u8bb8\u7f51\u7edc\u8bbf\u95ee\u5e76\u7ee7\u7eed\u6267\u884c\u4e2d\u6587\u4efb\u52a1"' | ConvertFrom-Json
@@ -169,9 +238,9 @@ try {
 
     $fixtureThread = "fixture-thread"
     $fixtureTurn = "fixture-turn"
-    $fixtureDirectory = Join-Path $testProfile ".codex\sessions\2026\09\10"
-    New-Item -ItemType Directory -Force -Path $fixtureDirectory | Out-Null
     $fixturePath = Join-Path $fixtureDirectory "rollout-$fixtureThread.jsonl"
+    $fixtureMetadata = @{ type = "session_meta"; payload = @{ id = $fixtureThread; source = "vscode" } } |
+        ConvertTo-Json -Depth 5 -Compress
     $fixtureLine = @{
         timestamp = "2026-09-10T00:04:00Z"
         type = "event_msg"
@@ -181,7 +250,7 @@ try {
             duration_ms = 240000
         }
     } | ConvertTo-Json -Compress
-    Set-Content -LiteralPath $fixturePath -Encoding ASCII -Value $fixtureLine
+    Set-Content -LiteralPath $fixturePath -Encoding ASCII -Value @($fixtureMetadata, $fixtureLine)
     $expectedTaskName = '"\u4e2d\u6587\u4efb\u52a1\u540d\u79f0"' | ConvertFrom-Json
     $indexLine = @{
         id = $fixtureThread
@@ -205,13 +274,88 @@ try {
     if ($fixtureBody -notmatch [regex]::Escape($expectedTaskName)) {
         throw "The hook must preserve a UTF-8 task name from session_index.jsonl."
     }
+    foreach ($timedEvent in @("Stop", "Interrupt")) {
+        $rolloutDurationOutput = Invoke-HookDryRun -EventName $timedEvent -DurationMs -1 -ExtraFields @{
+            session_id = $fixtureThread; turn_id = $fixtureTurn
+        }
+        if ([string]::IsNullOrWhiteSpace($rolloutDurationOutput)) {
+            throw "A main $timedEvent must read a qualifying duration from its matching rollout turn."
+        }
+        $unmatchedDurationOutput = Invoke-HookDryRun -EventName $timedEvent -DurationMs -1 -ExtraFields @{
+            session_id = $fixtureThread; turn_id = "unmatched-duration-turn"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($unmatchedDurationOutput)) {
+            throw "A main $timedEvent must not reuse another turn's qualifying duration."
+        }
+    }
+
+    # Stop may arrive before task_complete is persisted, while Codex still owns
+    # the rollout file. Its own task_started event is sufficient time evidence.
+    $activeThread = "active-main-thread"
+    $activePath = Join-Path $fixtureDirectory "rollout-$activeThread.jsonl"
+    $activeEvents = @(
+        @{ type = "session_meta"; payload = @{ id = $activeThread; source = "vscode" } },
+        @{ type = "event_msg"; payload = @{ type = "task_started"; turn_id = "active-main-turn"; started_at = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 240) } }
+    ) | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }
+    Set-Content -LiteralPath $activePath -Encoding UTF8 -Value $activeEvents
+    $activeWriter = [IO.File]::Open($activePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    try {
+        foreach ($timedEvent in @("Stop", "Interrupt")) {
+            $activeOutput = Invoke-HookDryRun -EventName $timedEvent -DurationMs -1 -ExtraFields @{
+                session_id = $activeThread; turn_id = "active-main-turn"
+            }
+            if ([string]::IsNullOrWhiteSpace($activeOutput)) {
+                throw "A main $timedEvent must derive elapsed time from task_started before task_complete is written."
+            }
+        }
+    }
+    finally { $activeWriter.Dispose() }
+
+    # Long desktop transcripts often contain image data. Qualifying events near
+    # the beginning must remain discoverable beyond a short tail window.
+    $longThread = "long-transcript-main"
+    $longPath = Join-Path $fixtureDirectory "rollout-$longThread.jsonl"
+    $longLines = New-Object 'Collections.Generic.List[string]'
+    foreach ($entry in @(
+        @{ type = "session_meta"; payload = @{ id = $longThread; source = "vscode" } },
+        @{ type = "event_msg"; payload = @{ type = "task_started"; turn_id = "long-active-turn"; started_at = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 240) } },
+        @{ type = "event_msg"; payload = @{ type = "task_complete"; turn_id = "long-complete-turn"; duration_ms = 190000 } },
+        @{ type = "event_msg"; payload = @{ type = "task_started"; turn_id = "missing-start-time" } },
+        @{ type = "event_msg"; payload = @{ type = "task_started"; turn_id = "null-start-time"; started_at = $null } }
+    )) { $longLines.Add(($entry | ConvertTo-Json -Depth 5 -Compress)) }
+    foreach ($recordIndex in 1..650) {
+        $longLines.Add((@{ type = "response_item"; payload = @{ type = "message"; content = "unrelated message $recordIndex" } } |
+            ConvertTo-Json -Depth 5 -Compress))
+    }
+    $longLines.Add((@{ type = "response_item"; payload = @{ type = "image"; content = ("x" * 1048576) } } |
+        ConvertTo-Json -Depth 5 -Compress))
+    $longLines.Add((@{ type = "event_msg"; payload = @{ type = "task_complete"; turn_id = "unrelated-long-turn"; duration_ms = 900000 } } |
+        ConvertTo-Json -Depth 5 -Compress))
+    Set-Content -LiteralPath $longPath -Encoding UTF8 -Value $longLines
+    foreach ($longTurn in @("long-active-turn", "long-complete-turn")) {
+        $longFields = @{ session_id = $longThread; turn_id = $longTurn }
+        if ([string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName "Stop" -DurationMs -1 -ExtraFields $longFields))) {
+            throw "Long transcripts must retain qualifying start/complete evidence before the last 600 records ($longTurn)."
+        }
+        if (-not [string]::IsNullOrWhiteSpace((Invoke-HookDryRun -EventName "Stop" -DurationMs -1 -MinimumDurationSeconds 300 -ExtraFields $longFields))) {
+            throw "Long transcripts must use the matching turn duration, not another turn's larger duration ($longTurn)."
+        }
+    }
+    foreach ($invalidStartTurn in @("missing-start-time", "null-start-time")) {
+        $invalidStartOutput = Invoke-HookDryRun -EventName "Stop" -DurationMs -1 -ExtraFields @{
+            session_id = $longThread; turn_id = $invalidStartTurn
+        }
+        if (-not [string]::IsNullOrWhiteSpace($invalidStartOutput)) {
+            throw "A task_started event with $invalidStartTurn must remain unknown instead of treating the start as the Unix epoch."
+        }
+    }
 
     # Desktop's legacy notify callback also fires when an internal child finishes.
     # A missing task name is not enough to distinguish children from main tasks.
     foreach ($sessionSource in @(
         @{ subagent = @{ thread_spawn = @{ parent_thread_id = $fixtureThread; depth = 1 } } },
         "subagent",
-        "vscode"
+        "vscode", "cli", "exec", "appServer", "app_server"
     )) {
         $sourceThread = "source-fixture-thread"
         $sourcePath = Join-Path $fixtureDirectory "rollout-$sourceThread.jsonl"
@@ -223,9 +367,17 @@ try {
         $sourceWriter = [IO.File]::Open($sourcePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
         try {
             $sourceOutput = Invoke-DryRun -DurationMs 300000 -EventPayload $sourcePayload
-            if ($sessionSource -is [string] -and $sessionSource -eq "vscode") {
+            if ($sessionSource -is [string] -and $sessionSource -ne "subagent") {
                 if ([string]::IsNullOrWhiteSpace($sourceOutput)) {
                     throw "A real main task must still notify, even without an indexed task name."
+                }
+                foreach ($mainEvent in @("Stop", "Interrupt", "SessionEnd")) {
+                    $mainHookOutput = Invoke-HookDryRun -EventName $mainEvent -ExtraFields @{
+                        session_id = $sourceThread; turn_id = "source-turn"
+                    }
+                    if ([string]::IsNullOrWhiteSpace($mainHookOutput)) {
+                        throw "A confirmed $sessionSource main task must still send $mainEvent without an indexed task name."
+                    }
                 }
             }
             elseif (-not [string]::IsNullOrWhiteSpace($sourceOutput)) {
@@ -251,7 +403,7 @@ try {
         finally { $sourceWriter.Dispose() }
     }
     $sourceLogs = Get-Content -LiteralPath $testLogPath -Encoding UTF8
-    if (-not ($sourceLogs -match 'complete\s+ignored\s+build=2026-10-06\.2 origin=notify thread=source-fixture-thread turn=source-turn subagent')) {
+    if (-not ($sourceLogs -match 'complete\s+ignored\s+build=\S+ origin=notify thread=source-fixture-thread turn=source-turn .*subagent')) {
         throw "Suppressed child completions must log their build, callback origin, thread and turn."
     }
 
@@ -421,7 +573,7 @@ try {
     $otherSession = @{ hook_event_name = "PermissionRequest"; session_id = "other-session"; approvals_reviewer = "user"; tool_name = "Bash" } | ConvertTo-Json
     & $scriptPath -NotificationJson $otherSession -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
     $stopAfterApproval = @{ hook_event_name = "Stop"; session_id = "approval-session"; turn_id = "stop-turn" } | ConvertTo-Json
-    & $scriptPath -NotificationJson $stopAfterApproval -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
+    & $scriptPath -NotificationJson $stopAfterApproval -DurationMsOverride 300000 -LogPath $testLogPath -StatePath $permissionStatePath | Out-Null
     if ($httpCapture.Count -ne 4) {
         throw "Permission deduplication must not suppress another session or Stop notifications."
     }
